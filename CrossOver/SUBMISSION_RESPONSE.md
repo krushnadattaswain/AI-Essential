@@ -108,6 +108,139 @@
 
 ---
 
+#### Decision 6: Customer-Facing RESTful API Design
+
+**Problem:** External customers will integrate Aperture into their applications. How do we design an API that's stable, well-documented, and easy to integrate while allowing the platform to evolve?
+
+**Alternatives:**
+- **(A) REST API with OpenAPI specification** – Industry standard, broad tooling support
+- **(B) GraphQL** – Flexible queries, single endpoint
+- **(C) gRPC with client libraries** – High performance, strongly typed
+
+**Decision:** REST API with OpenAPI 3.1 specification and versioned SDKs for major languages.
+
+**Rationale:** REST is universally understood and doesn't require specialized client libraries for basic usage. OpenAPI specification enables: (1) automated SDK generation for Python, JavaScript, Go, Java, (2) interactive documentation via Swagger UI, (3) contract testing in CI/CD, (4) mock servers for customer development. SDKs abstract authentication, retry logic, and provide idiomatic interfaces. Customers can use raw HTTP if preferred or leverage SDKs for faster integration. GraphQL adds query complexity that isn't needed for our use case. gRPC requires specific tooling that limits accessibility.
+
+**API Structure:**
+```
+POST   /v1/jobs                    # Create bulk processing job
+GET    /v1/jobs/{jobId}            # Get job status and progress
+GET    /v1/jobs/{jobId}/images     # List processed images with results
+DELETE /v1/jobs/{jobId}            # Cancel a running job
+POST   /v1/pipelines               # Create pipeline definition
+GET    /v1/pipelines/{pipelineId}  # Get pipeline details
+PUT    /v1/pipelines/{pipelineId}  # Update pipeline (creates new version)
+GET    /v1/marketplace/filters     # Browse available filters
+GET    /v1/marketplace/filters/{filterId}  # Get filter details
+POST   /v1/uploads/presign         # Get presigned upload URLs
+GET    /v1/usage                   # Get current billing period usage
+```
+
+**SDK Versioning:** SDKs follow semantic versioning independent of API versions. SDK v2.x supports API v1, with a 12-month overlap period when API v2 releases.
+
+---
+
+#### Decision 7: Platform API Versioning Strategy
+
+**Problem:** As Aperture evolves, we'll need to make breaking changes to our API. How do we version the platform API to give customers stability while allowing innovation?
+
+**Alternatives:**
+- **(A) URL versioning (/v1/, /v2/)** – Explicit, easy to route
+- **(B) Header versioning (Accept-Version: v1)** – Cleaner URLs, harder to test
+- **(C) Query parameter (?version=1)** – Discoverable but unusual
+- **(D) No versioning (evolve in place)** – Risky for customers
+
+**Decision:** URL-based versioning with 24-month Long-Term Support (LTS) for each major version.
+
+**Rationale:** URL versioning is explicit and works with any HTTP client without custom headers. Major API versions (/v1/, /v2/) are introduced when we have breaking changes. Each major version receives 24 months of LTS from the release of its successor:
+- v1 released: Fully supported
+- v2 released: v1 enters 24-month LTS (security fixes, critical bugs only)
+- v1 LTS ends: Returns 410 Gone with migration documentation link
+
+This gives enterprise customers predictable upgrade timelines. Minor releases (v1.1, v1.2) add features backward-compatibly and require no customer changes.
+
+**Compatibility Promise:**
+- New optional fields may be added to responses (clients must ignore unknown fields)
+- New optional parameters may be added to requests
+- Existing fields will not be removed or change type within a major version
+- Error codes are stable within a major version
+- Deprecation warnings appear in response headers 6 months before removal
+
+---
+
+#### Decision 8: Consumer-Driven Contract Testing
+
+**Problem:** How do we ensure API changes don't break existing customer integrations? Manual testing doesn't scale as customer count grows.
+
+**Alternatives:**
+- **(A) Manual regression testing** – Thorough but slow and error-prone
+- **(B) Consumer-driven contract tests (Pact)** – Customers define expectations, we verify
+- **(C) API snapshot testing** – Compare responses against golden files
+- **(D) Canary deployments only** – Catch issues in production
+
+**Decision:** Consumer-driven contracts with Pact, plus OpenAPI schema validation in CI.
+
+**Rationale:** Consumer-driven contracts capture how customers actually use the API, not just what we think they use. Key customers (and our own SDKs) publish Pact contracts. Our CI pipeline verifies all contracts pass before deployment. This catches breaking changes before they ship. OpenAPI schema validation ensures responses conform to our specification. Canary deployments provide a final safety net but shouldn't be the primary compatibility mechanism.
+
+**Process:**
+1. SDK repositories publish Pact contracts on each release
+2. Enterprise customers can optionally contribute contracts
+3. Aperture CI runs all contracts against PR changes
+4. Breaking change detected → CI fails → requires major version bump
+5. Contract coverage reports identify untested API surfaces
+
+---
+
+#### Decision 9: Standardized Error Response Contract
+
+**Problem:** Inconsistent error responses make client integration difficult and debugging painful. How do we ensure all errors are predictable and actionable?
+
+**Decision:** All errors follow RFC 7807 Problem Details format with Aperture-specific extensions.
+
+**Rationale:** RFC 7807 is an industry standard that provides machine-readable error details. Consistent structure enables SDKs to provide typed error handling. The `traceId` field enables support to quickly locate issues in distributed traces.
+
+**Error Response Format:**
+```json
+{
+  "type": "https://api.aperture.io/errors/validation-error",
+  "title": "Validation Error",
+  "status": 400,
+  "detail": "Pipeline step 3 references unknown filter 'blur_extreme'",
+  "instance": "/v1/pipelines/pip_123",
+  "errors": [
+    {
+      "field": "steps[2].filterId",
+      "code": "UNKNOWN_FILTER",
+      "message": "Filter 'blur_extreme' not found in marketplace"
+    }
+  ],
+  "traceId": "req_abc123def456",
+  "documentationUrl": "https://docs.aperture.io/errors/UNKNOWN_FILTER"
+}
+```
+
+**Standard Error Codes:**
+| Code | HTTP Status | Meaning | Retry |
+|------|-------------|---------|-------|
+| VALIDATION_ERROR | 400 | Request body failed validation | No |
+| INVALID_API_KEY | 401 | API key missing or invalid | No |
+| INSUFFICIENT_SCOPE | 403 | API key lacks required permission | No |
+| RESOURCE_NOT_FOUND | 404 | Requested resource doesn't exist | No |
+| CONFLICT | 409 | Resource state conflict (e.g., job already cancelled) | No |
+| RATE_LIMITED | 429 | Quota exceeded, retry after delay | Yes |
+| FILTER_TIMEOUT | 502 | Third-party filter exceeded timeout | Yes |
+| FILTER_ERROR | 502 | Third-party filter returned error | Maybe |
+| SERVICE_UNAVAILABLE | 503 | Platform temporarily unavailable | Yes |
+
+**Idempotency:** Mutating endpoints accept `Idempotency-Key` header. Same key within 24 hours returns cached response, enabling safe retries without duplicate job creation.
+
+```
+POST /v1/jobs
+Idempotency-Key: user-generated-unique-key-123
+```
+
+---
+
 ## Scenario B: Third-Party Filter Marketplace
 
 ### Important Facts
@@ -232,5 +365,308 @@ Output: { success, outputUrl?, error?, metrics? }
 **Decision:** Internal API Gateway with Lambda authorizer fronting cross-account Lambda invocations.
 
 **Rationale:** Direct invocation works but lacks observability and control—no built-in throttling, logging, or circuit breaking. Service mesh is overkill for this use case. An internal API Gateway provides: (1) per-filter rate limiting via usage plans, (2) centralized request/response logging, (3) timeout enforcement at gateway level, (4) integration with X-Ray for distributed tracing, (5) ability to add circuit breakers for failing filters, and (6) consistent error responses. The gateway authenticates using internal service tokens validated by a Lambda authorizer, then invokes the appropriate vendor filter via cross-account IAM roles. This adds ~10ms latency but provides operational visibility that's essential for a marketplace platform.
+
+---
+
+#### Decision 7: Customer API Authentication and Key Management
+
+**Problem:** How do customers authenticate to the Aperture API? Enterprise customers need granular access control, key rotation without downtime, and comprehensive audit trails for compliance.
+
+**Alternatives:**
+- **(A) Simple API keys** – Easy to implement, limited control
+- **(B) OAuth 2.0 with JWT** – Standard, complex setup for server-to-server
+- **(C) API keys with scoped permissions** – Balance of simplicity and control
+- **(D) Mutual TLS** – Strong security, complex client certificate management
+
+**Decision:** Scoped API keys with automatic rotation support and comprehensive audit logging.
+
+**Rationale:** OAuth adds complexity for server-to-server integrations (our primary use case) without proportional benefit. Mutual TLS requires certificate management that many customers can't support. Scoped API keys provide: (1) fine-grained permissions (read-only, specific pipelines, specific filters), (2) multiple keys per organization for different services/environments, (3) rotation without downtime via overlapping validity periods, (4) instant revocation, and (5) usage attribution for billing and debugging.
+
+**Key Structure:**
+- Prefix identifies key type: `ak_live_` for production, `ak_test_` for sandbox
+- 32 random bytes, base62 encoded for URL safety
+- Stored hashed (Argon2id), plaintext only shown once at creation
+- Metadata: scopes[], created_at, last_used_at, expires_at, created_by, description
+
+**Available Scopes:**
+```
+jobs:read          # View job status and results
+jobs:write         # Create and cancel jobs
+pipelines:read     # View pipeline definitions
+pipelines:write    # Create and modify pipelines
+marketplace:read   # Browse filters
+usage:read         # View usage and billing data
+admin:*            # Full organization access
+```
+
+**Key Rotation Process:**
+1. Create new key with same scopes (both keys active)
+2. Update client applications to use new key
+3. Monitor old key usage via audit logs
+4. Revoke old key once usage drops to zero
+
+**Audit Log Entry:**
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "eventType": "api.request",
+  "organizationId": "org_abc123",
+  "apiKeyId": "key_xyz789",
+  "apiKeyDescription": "Production backend",
+  "action": "job.create",
+  "resource": "job_456",
+  "requestId": "req_789xyz",
+  "ipAddress": "203.0.113.42",
+  "userAgent": "aperture-python/2.1.0",
+  "responseStatus": 201,
+  "durationMs": 127
+}
+```
+
+**Compliance:** Audit logs retained for 2 years, exportable via API for SIEM integration. SOC 2 Type II compliant storage with encryption at rest.
+
+---
+
+#### Decision 8: Local Development Environment for Filter Vendors
+
+**Problem:** Third-party developers need to build and test filters locally before deploying. Poor local development experience leads to slow iteration cycles, frustrated developers, and lower marketplace quality.
+
+**Alternatives:**
+- **(A) Develop directly in cloud sandbox** – No local setup required, but slow iteration (deploy on every change)
+- **(B) Local Docker environment matching production** – Fast iteration, but complex multi-container setup
+- **(C) CLI tool with hot-reload and local Lambda emulation** – Best developer experience, requires tooling investment
+
+**Decision:** Aperture CLI with local Lambda emulation via Docker and hot-reload support.
+
+**Rationale:** Developing directly in the cloud means every code change requires a deploy—unacceptable for rapid iteration. A full local Docker environment is complex to maintain and easy to misconfigure. The Aperture CLI (`aperture`) provides: (1) local Lambda emulation using AWS Lambda Runtime Interface Emulator, (2) hot-reload on file changes for interpreted languages, (3) sample images and test harnesses, (4) contract validation before push, (5) local metrics and logging dashboard, and (6) one-command deployment to sandbox.
+
+**Developer Workflow:**
+```bash
+# Install CLI
+npm install -g @aperture/cli
+
+# Authenticate with developer portal
+aperture login
+
+# Initialize new filter project from template
+aperture init my-filter --template=python-opencv
+# Templates available: python-opencv, python-pytorch, node-sharp, rust-image
+
+# Project structure created:
+# my-filter/
+# ├── src/
+# │   └── handler.py        # Filter implementation
+# ├── tests/
+# │   └── test_handler.py   # Unit tests
+# ├── aperture.yaml         # Filter configuration
+# ├── Dockerfile            # Container definition
+# └── sample-images/        # Test images
+
+# Start local development server with hot-reload
+aperture dev --watch
+# → Local server at http://localhost:9000
+# → Invoke: curl -X POST http://localhost:9000/invoke -d @test-payload.json
+
+# Run contract compliance tests
+aperture test
+# → Validates input/output schema compliance
+# → Checks timeout behavior
+# → Verifies error handling
+
+# Validate container before pushing
+aperture validate
+# → Security scan (Trivy)
+# → Size check (< 10GB)
+# → Contract version compatibility
+
+# Push to vendor sandbox environment
+aperture push --env=sandbox
+
+# Submit for marketplace review
+aperture submit --version=1.0.0 --changelog="Initial release"
+```
+
+**aperture.yaml Configuration:**
+```yaml
+name: my-awesome-filter
+version: 1.0.0
+contractVersion: "1.0"
+runtime: python3.11
+memory: 1024
+timeout: 30
+description: "Applies artistic style transfer to images"
+parameters:
+  - name: style
+    type: string
+    enum: [impressionist, cubist, watercolor]
+    required: true
+  - name: intensity
+    type: number
+    min: 0.0
+    max: 1.0
+    default: 0.5
+pricing:
+  perExecution: 0.002  # $0.002 per image
+```
+
+**Documentation:** Interactive tutorials in developer portal, API reference auto-generated from OpenAPI spec, example repositories for each supported language, community Discord for developer support, and office hours with Aperture engineering team.
+
+---
+
+## Cross-Cutting Platform Concerns
+
+### Important Facts
+
+1. **Multi-tenant platforms must protect against noisy neighbors.** One customer's excessive usage should not degrade service quality for others. Resource quotas and fair scheduling are essential for platform stability.
+
+2. **Enterprise customers require SLA guarantees to build their own commitments.** Documented availability targets, latency percentiles, and support response times enable customers to plan their architectures and set expectations with their users.
+
+3. **Platform boundaries require careful security design.** Authentication, authorization, rate limiting, and audit logging must work together to protect customer data while enabling legitimate use cases.
+
+---
+
+### Platform Technical Decisions
+
+#### Decision 1: Multi-Tenancy Resource Quotas and Fair-Use Protection
+
+**Problem:** In a multi-tenant platform, one customer's excessive usage (intentional or accidental) can degrade service for others. How do we ensure fair resource allocation while still allowing legitimate high-volume usage?
+
+**Alternatives:**
+- **(A) No limits, best-effort fairness** – Simple but creates unpredictable performance
+- **(B) Hard rate limits per customer** – Fair but inflexible, blocks legitimate spikes
+- **(C) Tiered quotas with burst capacity** – Balances fairness and flexibility
+- **(D) Dedicated capacity pools per customer** – Strong isolation but expensive and wasteful
+
+**Decision:** Tiered quotas with configurable burst capacity, fair queuing, and real-time usage visibility.
+
+**Rationale:** Enterprise customers need predictable capacity, but hard limits frustrate during legitimate traffic spikes. No limits creates a "tragedy of the commons" where aggressive users crowd out others. Dedicated pools waste resources when customers don't use their allocation. Tiered quotas with burst provide: (1) baseline capacity guaranteed per pricing tier, (2) burst capacity up to 3x baseline for short periods (measured over 1-minute windows), (3) fair queuing when system is constrained (customers receive proportional share based on tier), (4) enterprise option for reserved capacity with guaranteed minimums, and (5) real-time usage dashboards for self-service monitoring.
+
+**Default Quotas (per organization):**
+| Tier | Concurrent Jobs | Images/Hour | API Requests/Min | Burst Multiplier |
+|------|-----------------|-------------|------------------|------------------|
+| Free | 1 | 100 | 60 | 1x (no burst) |
+| Pro | 10 | 10,000 | 600 | 3x |
+| Enterprise | 100 | 100,000 | 6,000 | 5x |
+| Enterprise+ | Custom | Custom | Custom | Custom |
+
+**Rate Limit Response (HTTP 429):**
+```json
+{
+  "type": "https://api.aperture.io/errors/rate-limited",
+  "title": "Rate Limit Exceeded",
+  "status": 429,
+  "detail": "Concurrent job limit reached. You have 10 jobs running; limit is 10.",
+  "code": "RATE_LIMITED",
+  "limit": 10,
+  "current": 10,
+  "retryAfter": 30,
+  "upgradeUrl": "https://aperture.io/pricing",
+  "usageDashboard": "https://dashboard.aperture.io/usage"
+}
+```
+
+**Response Headers (on all requests):**
+```
+X-RateLimit-Limit: 600
+X-RateLimit-Remaining: 542
+X-RateLimit-Reset: 1705312800
+X-RateLimit-Resource: api-requests
+```
+
+---
+
+#### Decision 2: Platform SLA Commitments and Reliability Guarantees
+
+**Problem:** Enterprise customers need to know what reliability they can depend on. Without documented SLAs, customers can't make informed architecture decisions or set expectations with their own users.
+
+**Decision:** Tiered SLA with availability, latency, and support response guarantees, backed by service credits.
+
+**Rationale:** Different customers have different reliability needs. A startup can tolerate occasional downtime; an enterprise with contractual obligations to their customers cannot. Tiered SLAs allow customers to choose the reliability level that matches their needs and budget. Service credits provide financial accountability when we miss targets.
+
+**SLA Tiers:**
+
+| Metric | Pro | Enterprise | Enterprise+ |
+|--------|-----|------------|-------------|
+| Monthly Availability | 99.5% | 99.9% | 99.99% |
+| Job Start Latency (p95) | < 30s | < 10s | < 5s |
+| API Response Time (p95) | < 500ms | < 200ms | < 100ms |
+| Support Response (Sev1) | 24 hours | 4 hours | 1 hour |
+| Support Response (Sev2) | 48 hours | 8 hours | 4 hours |
+| Status Page | Public | Public + Private | Dedicated |
+| Incident Postmortems | Summary | Detailed | Custom RCA call |
+
+**Service Credits:**
+
+| Availability | Pro Credit | Enterprise Credit |
+|--------------|------------|-------------------|
+| < 99.5% / < 99.9% | 10% | 10% |
+| < 99.0% / < 99.5% | 25% | 25% |
+| < 95.0% / < 99.0% | 50% | 50% |
+| < 95.0% | — | 100% |
+
+**Exclusions:** Scheduled maintenance (announced 7 days in advance), third-party filter failures (vendor responsibility), customer-caused issues (API misuse, exceeded quotas).
+
+**Vendor SLA Cascade:** Aperture's SLA covers platform availability and performance, not individual filter reliability. Filter execution failures don't count against platform SLA if the platform correctly processed the request and returned the error. Marketplace displays vendor-reported reliability metrics (30-day success rate, p95 latency) to help customers choose reliable filters. Filters with < 95% success rate display a warning badge.
+
+**Measurement Methodology:**
+- Availability measured by synthetic probes every 30 seconds to all API endpoints from 5 geographic regions
+- A region is "down" if > 50% of probes fail in a 1-minute window
+- Global availability = weighted average by traffic volume
+- Latency measured from request receipt to response sent (excluding network transit)
+- Monthly reports available in customer dashboard
+
+**Incident Communication:**
+- Real-time status at status.aperture.io
+- Automated alerts via email, Slack, PagerDuty webhooks
+- Postmortem published within 5 business days for Sev1 incidents
+- Quarterly reliability reviews for Enterprise+ customers
+
+---
+
+#### Decision 3: Comprehensive Observability for Platform Operations
+
+**Problem:** Operating a multi-tenant platform requires deep visibility into system health, customer usage patterns, and potential issues before they impact users. How do we instrument the platform for operational excellence?
+
+**Alternatives:**
+- **(A) Basic CloudWatch metrics and logs** – Built-in but limited correlation
+- **(B) Third-party APM (Datadog, New Relic)** – Rich features but vendor lock-in and cost
+- **(C) OpenTelemetry with managed backends** – Vendor-neutral with flexibility
+- **(D) Custom observability stack** – Full control but significant maintenance burden
+
+**Decision:** OpenTelemetry instrumentation with AWS X-Ray for tracing, CloudWatch for metrics, and OpenSearch for logs, unified via correlation IDs.
+
+**Rationale:** OpenTelemetry provides vendor-neutral instrumentation that can export to any backend. AWS-managed services reduce operational burden. Correlation IDs (`traceId`) link logs, traces, and metrics for end-to-end debugging. This hybrid approach uses managed services where they excel while maintaining portability.
+
+**Instrumentation:**
+```
+Every request receives:
+- traceId: Unique identifier propagated through all services
+- spanId: Identifies each service hop
+- organizationId: Customer attribution
+- jobId/pipelineId: Resource context
+
+Metrics exported:
+- api.request.count (by endpoint, status, organization)
+- api.request.latency (p50, p95, p99 by endpoint)
+- job.processing.duration (by pipeline complexity)
+- filter.execution.duration (by filter, vendor)
+- filter.execution.success_rate (by filter, vendor)
+- queue.depth (SQS queue lengths)
+- lambda.concurrent_executions (by function)
+```
+
+**Alerting Rules:**
+- Error rate > 1% for 5 minutes → Page on-call
+- p95 latency > 2x baseline for 10 minutes → Page on-call
+- Queue depth growing for 15 minutes → Warn
+- Single customer > 50% of capacity → Warn
+- Filter success rate < 90% for 1 hour → Notify vendor
+
+**Customer-Facing Observability:**
+- Real-time job progress in dashboard
+- Historical job analytics (success rate, processing time trends)
+- Usage graphs by day/week/month
+- Cost breakdown by pipeline and filter
+- Exportable logs via API for customer's own analysis
 
 ---
